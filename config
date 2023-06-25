@@ -1,0 +1,381 @@
+Refrence link :
+https://docs.oracle.com/en/learn/ol-ha-nfs/index.html#introduction
+
+Introduction
+In this lab, we will create an NFS service hosted by three instances: ol-node01, ol-node02, and ol-node03. These instances will replicate a Gluster volume for data redundancy and use clustering tools for service redundancy.
+
+A fourth instance named ol-client will mount this NFS service for demonstration and testing.
+
+This tutorial is targeted at Oracle Linux 8 users, but the commands are also available on other Oracle Linux releases.
+
+Components:
+Corosync provides clustering infrastructure to manage which nodes are involved, their communication, and quorum.
+Pacemaker manages cluster resources and rules of their behavior.
+Gluster is a scalable and distributed filesystem.
+Ganesha is an NFS server that can use many different backing filesystem types, including Gluster.
+
+OS : oracle linux 8.8
+nodes : 3 + 1 client
+192.168.31.201 ol-node01
+192.168.31.202 ol-node01
+192.168.31.203 ol-node01
+192.168.31.204 client1
+- Timezone and chronyd should be configure
+- install and config local repository for oracle linux 8.8
+
+config /etc/hosts: (on all nodes)
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+192.168.31.201 ol-node01
+192.168.31.202 ol-node01
+192.168.31.203 ol-node01
+192.168.31.204 client1
+
+install and config ssh passwordless on all nodes:
+node01:
+ssh-keygen
+ssh-copy-id root@ol-node01
+ssh-copy-id root@ol-node02
+ssh-copy-id root@ol-node03
+
+node02:
+ssh-keygen
+ssh-copy-id root@ol-node01
+ssh-copy-id root@ol-node02
+ssh-copy-id root@ol-node03
+
+node03:
+ssh-keygen
+ssh-copy-id root@ol-node01
+ssh-copy-id root@ol-node02
+ssh-copy-id root@ol-node03
+
+==============================================
+
+Install packages:
+(On all nodes) Install the Gluster yum repository configuration:
+sudo dnf install -y oracle-gluster-release-el8
+sudo dnf config-manager --enable ol8_addons ol8_UEKR6 ol8_appstream
+sudo dnf install -y corosync glusterfs-server nfs-ganesha-gluster pacemaker pcs pcp-zeroconf fence-agents-all
+
+==============================================
+Create the Gluster volume:
+add disk 2 or disk 3 to virtual machine or physicam server then:
+
+on all nodes:
+sudo mkfs.xfs -f -i size=512 -L gluster-000 /dev/sdb
+sudo mkdir -p /data/glusterfs/sharedvol/mybrick
+echo 'LABEL=gluster-000 /data/glusterfs/sharedvol/mybrick xfs defaults  0 0' | sudo tee -a /etc/fstab > /dev/null
+sudo mount /data/glusterfs/sharedvol/mybrick
+df -hT 
+sudo systemctl enable --now glusterd
+systemctl stop firewalld ; systemctl disable firewalld
+sestatus 
+setenforce 0
+
+if you want to config firewall :
+sudo firewall-cmd --permanent --zone=trusted --add-source=192.168.31.0/24
+sudo firewall-cmd --permanent --zone=trusted --add-service=glusterfs
+sudo firewall-cmd --reload
+
+(On ol-node01) Create the Gluster environment by adding peers:
+sudo gluster peer probe ol-node02
+sudo gluster peer probe ol-node03
+sudo gluster peer status
+
+Example Output:
+Number of Peers: 2
+
+Hostname: ol-node02
+Uuid: 2607976e-7004-47e8-821c-7c6985961cda
+State: Peer in Cluster (Connected)
+Hostname: ol-node03
+Uuid: c51cb4aa-fccd-47f7-9fb2-edb5766991d2
+State: Peer in Cluster (Connected)
+
+(On ol-node01) Create a Gluster volume named sharedvol, which replicates across the three hosts: ol-node01, ol-node02, and ol-node03:
+sudo gluster volume create sharedvol replica 3 ol-node0{1,2,3}:/data/glusterfs/sharedvol/mybrick/brick
+
+(On ol-node01) Enable the sharedvol Gluster volume:
+sudo gluster volume start sharedvol
+sudo gluster volume info
+
+
+Example Output:
+Volume Name: sharedvol
+Type: Replicate
+Volume ID: 1608bc61-cd4e-4b64-a5f3-f5800b717f76
+Status: Started
+Snapshot Count: 0
+Number of Bricks: 1 x 3 = 3
+Transport-type: tcp
+Bricks:
+Brick1: ol-node01:/data/glusterfs/sharedvol/mybrick/brick
+Brick2: ol-node02:/data/glusterfs/sharedvol/mybrick/brick
+Brick3: ol-node03:/data/glusterfs/sharedvol/mybrick/brick
+Options Reconfigured:
+storage.fips-mode-rchecksum: on
+transport.address-family: inet
+nfs.disable: on
+performance.client-io-threads: off
+
+
+(On ol-node01) Get the status of the Gluster volume:
+sudo gluster volume status
+
+
+Example Output:
+Status of volume: sharedvol
+Gluster process                             TCP Port  RDMA Port  Online  Pid
+------------------------------------------------------------------------------
+Brick ol-node01:/data/glusterfs/sharedvol/m
+ybrick/brick                                49152     0          Y       78082
+Brick ol-node02:/data/glusterfs/sharedvol/m
+ybrick/brick                                49152     0          Y       77832
+Brick ol-node03:/data/glusterfs/sharedvol/m
+ybrick/brick                                49152     0          Y       77851
+Self-heal Daemon on localhost               N/A       N/A        Y       78099
+Self-heal Daemon on ol-node02               N/A       N/A        Y       77849
+Self-heal Daemon on ol-node03               N/A       N/A        Y       77868
+ 
+Task Status of Volume sharedvol
+------------------------------------------------------------------------------
+There are no active volume tasks
+
+
+
+gluster volume set sharedvol network.ping-timeout 1
+gluster volume set  sharedvol nfs.disable off
+systemctl restart glusterd
+systemctl restart nfs-ganesha
+
+
+
+===========================================
+Configure Ganesha:
+(On all nodes) Populate the file /etc/ganesha/ganesha.conf with the given configuration:
+
+sudo tee /etc/ganesha/ganesha.conf > /dev/null <<'EOF'
+EXPORT{
+    Export_Id = 1 ;       # Unique identifier for each EXPORT (share)
+    Path = "/sharedvol";  # Export path of our NFS share
+
+    FSAL {
+        name = GLUSTER;          # Backing type is Gluster
+        hostname = "localhost";  # Hostname of Gluster server
+        volume = "sharedvol";    # The name of our Gluster volume
+    }
+
+    Access_type = RW;          # Export access permissions
+    Squash = No_root_squash;   # Control NFS root squashing
+    Disable_ACL = FALSE;       # Enable NFSv4 ACLs
+    Pseudo = "/sharedvol";     # NFSv4 pseudo path for our NFS share
+    Protocols = "3","4" ;      # NFS protocols supported
+    Transports = "UDP","TCP" ; # Transport protocols supported
+    SecType = "sys";           # NFS Security flavors supported
+}
+EOF
+
+systemctl restart nfs-ganesha
+systemctl enable nfs-ganesha
+systemctl restart glusterd
+systemctl enable glusterd
+
+=========================================================
+
+Create a Cluster:
+(On all nodes) Set a shared password for the user hacluster:
+passwd hacluster
+
+(On all nodes) Enable the Corosync and Pacemaker services:
+sudo systemctl enable corosync
+sudo systemctl enable pacemaker
+sudo systemctl enable --now pcsd
+
+if you have firewalld:
+sudo firewall-cmd --permanent --zone=trusted --add-service=high-availability
+sudo firewall-cmd --reload
+
+(On ol-node01) Authenticate with all cluster nodes using the hacluster user and password defined above:
+sudo pcs host auth ol-node01 ol-node02 ol-node03 
+username:hacluster
+password:******
+
+(On ol-node01) Create a cluster named HA-NFS:
+sudo pcs cluster setup HA-NFS ol-node01 ol-node02 ol-node03
+sudo pcs cluster start --all
+sudo pcs cluster enable --all
+
+(On ol-node01) Disable STONITH:
+STONITH is a feature of Linux for maintaining the integrity of nodes in a high-availability (HA) cluster. STONITH automatically powers down, or fences, a node that is not working correctly. An administrator may utilize STONITH if one of the nodes in a cluster is unreachable by the other node(s) in the cluster.
+
+sudo pcs property set stonith-enabled=false
+sudo pcs property set no-quorum-policy=ignore
+
+sudo pcs cluster status
+pcs status
+
+Example Output:
+Cluster Status:
+ Cluster Summary:
+   * Stack: corosync
+   * Current DC: ol-node03 (version 2.1.0-8.0.1.el8-7c3f660707) - partition with quorum
+   * Last updated: Wed May  4 16:47:55 2022
+   * Last change:  Wed May  4 16:47:47 2022 by hacluster via crmd on ol-node03
+   * 3 nodes configured
+   * 0 resource instances configured
+ Node List:
+   * Online: [ ol-node01 ol-node02 ol-node03 ]
+
+PCSD Status:
+  ol-node01: Online
+  ol-node03: Online
+  ol-node02: Online
+
+=====================================================
+Create Cluster Services:
+(On all nodes) Configure the firewall to allow traffic on the ports that are specifically used by NFS: (optional=  if you have firewalld service and enabled)
+sudo firewall-cmd --permanent --zone=trusted --add-service=nfs
+sudo firewall-cmd --reload
+
+(On ol-node01) Create a systemd based cluster resource to ensure nfs-ganesha is running:
+sudo pcs resource create nfs_server systemd:nfs-ganesha op monitor interval=3s
+
+(On ol-node01) Create an IP cluster resource used to present the NFS server:
+sudo pcs resource create nfs_ip ocf:heartbeat:IPaddr2 ip=192.168.31.220 cidr_netmask=24 op monitor interval=3s
+
+(On ol-node01) Join the Ganesha service and IP resource in a group to ensure they remain together on the same host:
+sudo pcs resource group add nfs_group nfs_server nfs_ip
+sudo pcs status
+ip addr show dev ens160   # you should see that NIC must have two IP address (192.168.31.201 and 192.168.31.220)
+corosync-quorumtool
+
+Example Output:
+Cluster name: HA-NFS
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: ol-node03 (version 2.1.0-8.0.1.el8-7c3f660707) - partition with quorum
+  * Last updated: Wed May  4 16:52:56 2022
+  * Last change:  Wed May  4 16:52:39 2022 by root via cibadmin on ol-node01
+  * 3 nodes configured
+  * 2 resource instances configured
+
+Node List:
+  * Online: [ ol-node01 ol-node02 ol-node03 ]
+
+Full List of Resources:
+  * Resource Group: nfs_group:
+    * nfs_server	(systemd:nfs-ganesha):	 Started ol-node01
+    * nfs_ip	(ocf::heartbeat:IPaddr2):	 Started ol-node01
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
+
+==============================================================
+Test NFS availability using a client:
+vim /etc/hosts
+192.168.31.220 nfs
+192.168.31.201 ol-node01
+192.168.31.202 ol-node01
+192.168.31.203 ol-node01
+192.168.31.204 client1
+
+
+sudo dnf install -y nfs-utils glusterfs-fuse
+sudo mkdir /sharedvol
+ping nfs   >>>>  ping 192.168.31.220  == Virtual IP
+sudo mount -t glusterfs nfs:/sharedvol /sharedvol
+df -h /sharedvol/
+echo "Hello from Oracle CloudWorld" | sudo tee /sharedvol/hello > /dev/null
+
+on ol-node01:
+pcs node standby ol-node01   or   shutdown the node01 server completely.
+sudo pcs status
+on ol-node02:
+pcs status 
+ip addr show dev ens160  # you should see VIrtual IP address from the below main IP server (192.168.31.202 and 192.168.31.220)
+corosync-quorumtool
+(On ol-node01) Bring the standby node back into the cluster:
+sudo pcs node unstandby ol-node01
+pcs status 
+corosync-quorumtool
+
+(On ol-node01) Move resources back to ol-node01:
+sudo pcs resource move nfs_ip ol-node01
+sudo pcs status
+ip addr show dev ens160  # you should see VIrtual IP address from the below main IP server (192.168.31.201 and 192.168.31.220)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
